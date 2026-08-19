@@ -1,4 +1,4 @@
- 用户定义 User-defined
+# 用户定义 User-defined
 # cargo
 . "$HOME/.cargo/env"
 # rustup
