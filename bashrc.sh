@@ -28,6 +28,14 @@ __time_prompt() {
     date "+%Y.%m.%d.%H:%M:%S"
 }
 
+info() {
+    printf '[%s][info] %s\n' "$(__time_prompt)" "$*"
+}
+
+error() {
+    printf '[%s][error] %s\n' "$(__time_prompt)" "$*" >&2
+}
+
 # 构建 PS1
 # 注意:${COLOR_...} 是 ANSI 转义序列,需放在 '[' 和 '\]' 之间以正确计算长度(可选)
 PS1="\[${COLOR_VENV}\]\$(__venv_prompt)\[${COLOR_RESET}\]"
