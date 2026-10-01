@@ -1,3 +1,4 @@
+
 # 用户定义 User-defined
 # cargo
 . "$HOME/.cargo/env"
@@ -46,6 +47,11 @@ PS1+="\r\n\$ "
 
 export PS1
 
-printf "Was vernünftig ist, das ist wirklich;\r\n"
-printf "und was wirklich ist, das ist vernünftig.\r\n"
-printf "                                         ---- G.W.F.Hegel\r\n"
+# 仅交互式 shell 打印:否则会污染 scp/sftp/rsync 等非交互会话的协议流
+if [[ $- == *i* ]]; then
+    printf "Was vernünftig ist, das ist wirklich;\r\n"
+    printf "und was wirklich ist, das ist vernünftig.\r\n"
+    printf "                                         ---- G.W.F.Hegel\r\n"
+fi
+
+#fastfetch #--sixel ~/fetch.png --logo-width 40
