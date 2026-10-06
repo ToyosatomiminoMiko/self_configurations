@@ -17,22 +17,47 @@ email 解析器来拆才稳,为了一个文件多背整个解析器不划算,而
 够用;现在 -F 一律回 415 并提示改法,绝不落盘半截内容。
 
 启动:
-  python3 text_server.py [--host 0.0.0.0] [--port 8080] [--dir ./uploads]
+  python3 text_server.py
+  参数没有命令行开关:直接改下面的 HOST / PORT / UPLOAD_DIR,或者在脚本同目录放一个
+  text_server_config.py,里面写同名变量,启动时只覆盖你写了的那几个,例如 PORT = 9000。
+  为什么用 .py 当配置文件:能写注释、能算表达式(如 os.path.expanduser("~/drop")),
+  还不用为了几行配置多写一个解析器;文件不存在就走默认值,不影响直接跑。
   请求 body 整块读进内存,适合中小文件;这是内网自用小工具,没做额外防御,
   出错就回一行 500 或者直接崩掉重起。
 
 元信息:精简重写 2026-10-06,547 行 -> 229 行(实际代码约 130 行);同日去掉 multipart
-(-F)支持,不再依赖 email 解析器。需要 Python 3.10+。
+(-F)支持(不再依赖 email 解析器),并去掉命令行参数改为内部变量 + 可选
+text_server_config.py。需要 Python 3.10+。
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import BinaryIO, ClassVar, Sequence
+from typing import BinaryIO, ClassVar
 from urllib.parse import parse_qs, unquote, urlparse
+
+# --- 参数:改这里就生效 -----------------------------------------------------------
+
+HOST = "0.0.0.0"  # 监听地址,0.0.0.0 = 所有网卡
+PORT = 8080
+# 为什么锚定脚本目录:从任何 cwd 启动,文件都落在脚本旁边的 uploads/,不会散在工作目录里
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+
+try:
+    import text_server_config as _config  # 可选:与脚本同目录,不在就忽略
+except ModuleNotFoundError as error:
+    # 为什么细分 error.name:配置文件里 import 的库缺失时抛的也是 ModuleNotFoundError,
+    # 那种情况必须炸出来,不能悄悄退回默认参数、让人以为配置已经生效
+    if error.name != "text_server_config":
+        raise
+    _config = None
+
+if _config is not None:
+    HOST = getattr(_config, "HOST", HOST)
+    PORT = getattr(_config, "PORT", PORT)
+    UPLOAD_DIR = getattr(_config, "UPLOAD_DIR", UPLOAD_DIR)
 
 # 为什么:输出重定向到文件/管道时 stdout 默认块缓冲,收到的内容会卡在缓冲区里看不见
 if hasattr(sys.stdout, "reconfigure"):
@@ -186,26 +211,19 @@ class Handler(BaseHTTPRequestHandler):
         return name or None
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="内网文件投放服务器:收 curl 发来的文件/文本")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址,0.0.0.0 = 所有网卡")
-    parser.add_argument("--port", type=int, default=8080, help="监听端口")
-    parser.add_argument("--dir", dest="upload_dir",
-                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads"),
-                        help="存盘目录,默认脚本同级的 uploads/")
-    args = parser.parse_args(argv)
-
-    Handler.upload_dir = os.path.abspath(args.upload_dir)
+def main() -> int:
+    Handler.upload_dir = os.path.abspath(UPLOAD_DIR)
     os.makedirs(Handler.upload_dir, exist_ok=True)
     try:
         # 为什么多线程:HTTPServer 是单线程的,一个挂住的连接会把后面所有请求一起堵死
-        with ThreadingHTTPServer((args.host, args.port), Handler) as server:
-            print(f"receiving on http://{args.host}:{server.server_address[1]}/  ->  {Handler.upload_dir}")
+        with ThreadingHTTPServer((HOST, PORT), Handler) as server:
+            # 为什么用 server_address[1] 而不是 PORT:PORT 写 0 时由系统挑端口,这里报的是真实端口
+            print(f"receiving on http://{HOST}:{server.server_address[1]}/  ->  {Handler.upload_dir}")
             server.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
     except OSError as error:
-        print(f"error: 监听 {args.host}:{args.port} 失败: {error}", file=sys.stderr)
+        print(f"error: 监听 {HOST}:{PORT} 失败: {error}", file=sys.stderr)
         return 1
     return 0
 
