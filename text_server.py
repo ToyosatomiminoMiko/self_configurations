@@ -12,6 +12,16 @@
   其余(纯文本 POST)                      -> 只打到 stdout,响应里也会这么说
   同名不覆盖,自动加 .1 .2 后缀。
 
+响应规范(所有回包都出自 Handler.respond,没有第二个写 wfile 的地方):
+  HTTP 状态码 + 一行纯文本 body,以 \n 结尾;首词由状态码推出,2xx 是 ok,4xx/5xx 是 error,
+  调用方只提供后半句"说明":
+    ok                                    # GET / 探活
+    ok saved uploads/a.txt (16 bytes)     # 落盘成功
+    ok text 16 bytes (只打印到 stdout,未落盘)
+    error 不再支持 multipart(-F);改用 ...  # 出错时一行写完,不换行、不带 HTML
+  http.server 自带的错误回包(畸形请求行、没实现的方法等)已覆写进同一个出口,
+  所以不管哪条路径,客户端拿到的都是这一种形状,看首词就能判成败。
+
 为什么不再收 multipart:curl -F 那套(多字段表单、RFC 2231 文件名编码)要让标准库的
 email 解析器来拆才稳,为了一个文件多背整个解析器不划算,而 PUT / --data-binary 本来就
 够用;现在 -F 一律回 415 并提示改法,绝不落盘半截内容。
@@ -26,8 +36,8 @@ email 解析器来拆才稳,为了一个文件多背整个解析器不划算,而
   出错就回一行 500 或者直接崩掉重起。
 
 元信息:精简重写 2026-10-06,547 行 -> 229 行(实际代码约 130 行);同日去掉 multipart
-(-F)支持(不再依赖 email 解析器),并去掉命令行参数改为内部变量 + 可选
-text_server_config.py。需要 Python 3.10+。
+(-F)支持(不再依赖 email 解析器),去掉命令行参数改为内部变量 + 可选
+text_server_config.py,并把所有回包收敛到 Handler.respond 一种格式。需要 Python 3.10+。
 """
 
 from __future__ import annotations
@@ -152,20 +162,50 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         print("%s - %s" % (self.address_string(), format % args), file=sys.stderr)
 
-    def _reply(self, status: int, message: str) -> None:
-        """回一个纯文本响应;body 一律带上长度,keep-alive 下才不错帧。"""
-        payload = message.encode("utf-8")
+    # --- 响应:所有回包只走这一个出口 -----------------------------------------
+
+    def respond(self, status: int, detail: str = "") -> None:
+        """回给客户端的所有内容都从这里出去;格式见模块开头的"响应规范"。
+
+        为什么只留一个出口:状态码和文案分两处写迟早对不上(比如回了 415、文案还是 "ok ..."),
+        现在 ok/error 前缀由状态码自己推出来,调用方只写"说明"那一半。
+        为什么每次都要精确的 Content-Length:keep-alive 下客户端靠长度判断 body 结束,
+        少算一个字节就会把响应粘到下一条请求的响应上。
+        """
+        word = "ok" if status < 400 else "error"
+        # 为什么没有说明时不补空格:"ok " 带个尾空格很难看也不好比对
+        text = f"{word} {detail}" if detail else word
+        payload = (text + "\n").encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        # 为什么 HEAD 不写 body:HEAD 的定义就是只要头部;本服务没实现 do_HEAD,
+        # HEAD 会走到 send_error 再回到这里,标准库原来也是这么跳过的
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
+    def send_error(self, code: int, message: str | None = None,
+                   explain: str | None = None) -> None:
+        """把 http.server 自带的错误回包(畸形请求行、没实现的方法等)也收回 respond。
+
+        为什么必须覆写:这几条路径是标准库自己触发的,不拦下来就会回一坨 HTML,
+        客户端有时拿到一行纯文本、有时拿到一个网页,格式就谈不上统一了。
+        为什么不做别的:日志照旧打一份(否则错误在 stderr 里看不见),是否关连接由
+        parse_request 在出错路径上置好的 close_connection 决定,这里不抢着改。
+        """
+        self.log_error("code %d, message %s", code, message)
+        if message is None:
+            # 为什么自己查表:标准库在这里也是拿 responses 里的短语补 message 的,照做才不会
+            # 让 414 这种"只给状态码"的路径回一个光秃秃的 "error"(连原因都没有)
+            message = self.responses.get(code, ("", ""))[0]
+        self.respond(code, message or explain or "")
 
     # --- 各方法 -------------------------------------------------------------
 
     def do_GET(self) -> None:
         # 是:浏览器或 curl 直接打开能看到 ok,方便确认连得上
-        self._reply(200, "ok")
+        self.respond(200)
 
     def do_POST(self) -> None:
         self._receive()
@@ -175,16 +215,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _receive(self) -> None:
         try:
-            self._reply(200, self._store(read_body(self)))
+            self.respond(200, self._store(read_body(self)))
         except UnsupportedMedia as error:
             # 为什么不用关连接:read_body 已经把 body 读干净,keep-alive 下不会再错帧
-            self._reply(415, f"error: {error}")
+            self.respond(415, str(error))
         except Exception as error:  # 是:单个请求出错只回一行,不拖垮整个进程
             # 为什么关连接:此时 body 多半没读完,留着 keep-alive 会把残留字节当成下一轮的请求行
             self.close_connection = True
-            self._reply(500, f"error: {type(error).__name__}: {error}")
+            self.respond(500, f"{type(error).__name__}: {error}")
 
     def _store(self, body: bytes) -> str:
+        """存盘/打印,返回给 respond 的"说明"部分(不带 ok/error 前缀,那是 respond 按状态码加的)。"""
         if self.headers.get("Content-Type", "").lower().startswith("multipart/form-data"):
             # 为什么直接拒而不是退回自己拆:multipart 的边界扫描和 RFC 2231 编码手写很容易出错,
             # 会存下被截断或乱码的文件;拒掉并报出替代写法,客户端一眼能改对
@@ -196,8 +237,8 @@ class Handler(BaseHTTPRequestHandler):
         if hint is None:
             # 是:没给文件名的普通 POST 当文本处理,只打到 stdout,方便直接粘贴一段文字
             print(body.decode("utf-8", "replace"))
-            return f"ok text {len(body)} bytes (只打印到 stdout,未落盘)"
-        return "ok " + save(self.upload_dir, hint, body)
+            return f"text {len(body)} bytes (只打印到 stdout,未落盘)"
+        return save(self.upload_dir, hint, body)
 
     def _name_hint(self) -> str | None:
         """文件名提示:X-Filename 头 > ?name= / ?filename= > URL 路径最后一段;都没有则 None。"""
