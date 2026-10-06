@@ -2,24 +2,27 @@
 """内网文件投放服务器:只依赖标准库,收 curl 发来的文件或文本。
 
 用法:
-  curl -F "file=@a.txt" http://ip:8080/                       # 传文件(推荐)
   curl -T a.bin http://ip:8080/                               # PUT;URL 以 / 结尾时 curl 会自己补上文件名
   tar cz . | curl -T - "http://ip:8080/?name=src.tgz"         # 管道流式上传(大小未知,走 chunked)
   curl --data-binary @a.bin -H "X-Filename: a.bin" http://ip:8080/
   echo 一段文字 | curl --data-binary @- http://ip:8080/        # 纯文本只打到 stdout
 
-存还是不存(规则就这三条):
-  multipart(用了 -F)                     -> 存文件
+存还是不存(规则就这两条):
   带文件名提示(X-Filename / ?name= / URL 路径) -> 存
   其余(纯文本 POST)                      -> 只打到 stdout,响应里也会这么说
   同名不覆盖,自动加 .1 .2 后缀。
+
+为什么不再收 multipart:curl -F 那套(多字段表单、RFC 2231 文件名编码)要让标准库的
+email 解析器来拆才稳,为了一个文件多背整个解析器不划算,而 PUT / --data-binary 本来就
+够用;现在 -F 一律回 415 并提示改法,绝不落盘半截内容。
 
 启动:
   python3 text_server.py [--host 0.0.0.0] [--port 8080] [--dir ./uploads]
   请求 body 整块读进内存,适合中小文件;这是内网自用小工具,没做额外防御,
   出错就回一行 500 或者直接崩掉重起。
 
-元信息:精简重写 2026-10-06,547 行 -> 229 行(实际代码约 130 行);需要 Python 3.10+。
+元信息:精简重写 2026-10-06,547 行 -> 229 行(实际代码约 130 行);同日去掉 multipart
+(-F)支持,不再依赖 email 解析器。需要 Python 3.10+。
 """
 
 from __future__ import annotations
@@ -27,8 +30,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from email import policy
-from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import BinaryIO, ClassVar, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
@@ -67,6 +68,10 @@ def read_body(handler: BaseHTTPRequestHandler) -> bytes:
     return handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
 
 
+class UnsupportedMedia(Exception):
+    """客户端用了本服务器不支持的请求编码(目前只有 multipart/form-data),由 Handler 回 415。"""
+
+
 def fix_name(name: str) -> str:
     """把头部里的文件名还原成正常文本。
 
@@ -76,27 +81,8 @@ def fix_name(name: str) -> str:
     try:
         raw = name.encode("latin-1", "surrogateescape")
     except UnicodeEncodeError:
-        return name  # 已经是正确解码的(例如 filename*=utf-8''...)
+        return name  # 已经是正确解码的(值里有 latin-1 装不下的字符)
     return raw.decode("utf-8", "replace")
-
-
-def parse_multipart(body: bytes, content_type: str) -> list[tuple[str, str | None, bytes]]:
-    """拆 multipart/form-data,返回 (字段名, 文件名或 None, 内容)。
-
-    为什么交给标准库的 email 解析器:边界扫描、引号、RFC 2231 编码它都自带,
-    比手写 split(b"--boundary") 又短又稳(内容里恰好出现边界字节时,裸切会把文件截断)。
-    坑:必须显式写 policy=default,默认的 compat32 政策没有 iter_parts()。
-    """
-    message = BytesParser(policy=policy.default).parsebytes(
-        b"Content-Type: " + content_type.encode("latin-1", "replace") + b"\r\n\r\n" + body
-    )
-    parts: list[tuple[str, str | None, bytes]] = []
-    for part in message.iter_parts():
-        field = part.get_param("name", header="content-disposition")
-        if field is None:
-            continue  # 没有 name= 的段不符合表单语义,丢掉
-        parts.append((field, part.get_filename(), part.get_payload(decode=True) or b""))
-    return parts
 
 
 def safe_name(name: str) -> str:
@@ -135,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # 为什么用 HTTP/1.1:curl 发 body 前会等 Expect: 100-continue,1.0 不回应它,curl 要白等 1 秒
     protocol_version = "HTTP/1.1"
-    server_version = "text_server/3.0"
+    server_version = "text_server/3.1"
     upload_dir: ClassVar[str] = ""
 
     def log_message(self, format: str, *args: object) -> None:
@@ -165,26 +151,22 @@ class Handler(BaseHTTPRequestHandler):
     def _receive(self) -> None:
         try:
             self._reply(200, self._store(read_body(self)))
+        except UnsupportedMedia as error:
+            # 为什么不用关连接:read_body 已经把 body 读干净,keep-alive 下不会再错帧
+            self._reply(415, f"error: {error}")
         except Exception as error:  # 是:单个请求出错只回一行,不拖垮整个进程
             # 为什么关连接:此时 body 多半没读完,留着 keep-alive 会把残留字节当成下一轮的请求行
             self.close_connection = True
             self._reply(500, f"error: {type(error).__name__}: {error}")
 
     def _store(self, body: bytes) -> str:
-        content_type = self.headers.get("Content-Type", "")
-        if content_type.lower().startswith("multipart/form-data"):
-            saved: list[str] = []
-            for field, filename, data in parse_multipart(body, content_type):
-                if filename is None:
-                    # 是:curl -F "file=./a.nix" 少了 @,curl 会把这串路径当普通文本字段发过来
-                    print(f"{field} = {data.decode('utf-8', 'replace')} "
-                          f'(普通字段,不是文件;传文件要写 @: -F "{field}=@文件路径")')
-                else:
-                    saved.append(save(self.upload_dir, fix_name(filename), data))
-            if saved:
-                return "ok " + "; ".join(saved)
-            return 'ok (multipart 里没有文件:传文件要写 @,例如 -F "file=@a.txt")'
-
+        if self.headers.get("Content-Type", "").lower().startswith("multipart/form-data"):
+            # 为什么直接拒而不是退回自己拆:multipart 的边界扫描和 RFC 2231 编码手写很容易出错,
+            # 会存下被截断或乱码的文件;拒掉并报出替代写法,客户端一眼能改对
+            raise UnsupportedMedia(
+                '不再支持 multipart(-F);改用 "curl -T a.bin http://ip:8080/" 或 '
+                '"curl --data-binary @a.bin -H \'X-Filename: a.bin\' http://ip:8080/"'
+            )
         hint = self._name_hint()
         if hint is None:
             # 是:没给文件名的普通 POST 当文本处理,只打到 stdout,方便直接粘贴一段文字
@@ -195,8 +177,11 @@ class Handler(BaseHTTPRequestHandler):
     def _name_hint(self) -> str | None:
         """文件名提示:X-Filename 头 > ?name= / ?filename= > URL 路径最后一段;都没有则 None。"""
         query = parse_qs(urlparse(self.path).query)
-        name = (self.headers.get("X-Filename")
-                or (query.get("name") or query.get("filename") or [""])[0]
+        # 为什么只有头要 fix_name:?name= 与 URL 路径在 parse_qs/unquote 里已按 UTF-8 解码,
+        # 而自定义头被 http.server 按 latin-1 解,中文名到了这里还是乱码
+        header = self.headers.get("X-Filename")
+        name = (fix_name(header) if header
+                else (query.get("name") or query.get("filename") or [""])[0]
                 or os.path.basename(unquote(urlparse(self.path).path)))
         return name or None
 
