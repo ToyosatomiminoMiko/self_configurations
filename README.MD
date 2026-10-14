@@ -35,9 +35,18 @@ uv pip install --python .venv/bin/python -r requirements.txt
 python3 apps/text_server.py
 ```
 
-没有命令行开关,直接改脚本顶部的 `HOST` / `PORT` / `UPLOAD_DIR`;
-想在不动源码的前提下覆盖,就在**脚本同目录**放一个 `apps/text_server_config.py`,写同名变量即可
-(该文件名已被 ignore,是本地配置)。上传落盘目录是 `apps/uploads/`,同样不入库。
+没有命令行开关,默认值(`host` / `port` / `upload_dir`)在脚本的 `DEFAULTS` 里;
+想在不动源码的前提下覆盖,就在**脚本同目录**放一个 `apps/text_server.toml`,只写要改的字段:
+
+```toml
+host = "0.0.0.0"        # 监听地址, 0.0.0.0 = 所有网卡
+port = 8080             # 监听端口
+upload_dir = "uploads"  # 落盘目录, 相对路径按本文件所在目录解析
+```
+
+该文件已 ignore,不入库;不存在就全用默认值(上传默认落在 `apps/uploads/`,同样不入库)。
+字段名写错或类型不对会在启动阶段报错退出,不会静默退回默认值。解析用标准库 `tomllib`,
+所以需要 Python 3.11+。
 
 ## config/
 
@@ -57,6 +66,6 @@ python3 apps/text_server.py
 
 ## 说明
 
-- `uploads/`、`__pycache__/`、`.venv/`、`conf.toml`、`text_server_config.py` 均为本地内容,已在
+- `uploads/`、`__pycache__/`、`.venv/`、`conf.toml`、`text_server.toml` 均为本地内容,已在
   `.gitignore` 或各自目录的 `.gitignore` 里排除。
 - 原先散在根目录的文件已用 `git mv` 归位,历史保留;移动记录见 `git log --follow <文件>`。

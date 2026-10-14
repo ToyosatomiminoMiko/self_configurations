@@ -28,46 +28,97 @@ email 解析器来拆才稳,为了一个文件多背整个解析器不划算,而
 
 启动:
   python3 text_server.py
-  参数没有命令行开关:直接改下面的 HOST / PORT / UPLOAD_DIR,或者在脚本同目录放一个
-  text_server_config.py,里面写同名变量,启动时只覆盖你写了的那几个,例如 PORT = 9000。
-  为什么用 .py 当配置文件:能写注释、能算表达式(如 os.path.expanduser("~/drop")),
-  还不用为了几行配置多写一个解析器;文件不存在就走默认值,不影响直接跑。
+  参数没有命令行开关:默认值在下面的 DEFAULTS 里,想在不动源码的前提下覆盖,就在脚本同目录
+  放一个 text_server.toml,只写要改的字段,例如 port = 9000。
+  为什么用 TOML:解析用标准库 tomllib(Python 3.11+),不用装依赖;而以前那套"把 .py 当配置
+  import 进来"要靠捕获 ModuleNotFoundError 才能判断文件在不在,路径还依赖 sys.path,
+  变量名打错也照样静默用默认值(见元信息)。
+  文件不存在就全用 DEFAULTS;字段名写错或类型不对会在启动阶段直接报错,不静默忽略。
   请求 body 整块读进内存,适合中小文件;这是内网自用小工具,没做额外防御,
   出错就回一行 500 或者直接崩掉重起。
 
 元信息:精简重写 2026-10-06,547 行 -> 229 行(实际代码约 130 行);同日去掉 multipart
 (-F)支持(不再依赖 email 解析器),去掉命令行参数改为内部变量 + 可选
-text_server_config.py,并把所有回包收敛到 Handler.respond 一种格式。需要 Python 3.10+。
+text_server_config.py,并把所有回包收敛到 Handler.respond 一种格式。
+2026-10-15 把可选的 text_server_config.py 换成同目录的 text_server.toml(tomllib),
+配置字段名写错不再静默失效。需要 Python 3.11+。
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar
 from urllib.parse import parse_qs, unquote, urlparse
 
-# --- 参数:改这里就生效 -----------------------------------------------------------
+# --- 配置:默认值写在这里,脚本同目录的 text_server.toml 按字段覆盖 -----------------
 
-HOST = "0.0.0.0"  # 监听地址,0.0.0.0 = 所有网卡
-PORT = 8080
-# 为什么锚定脚本目录:从任何 cwd 启动,文件都落在脚本旁边的 uploads/,不会散在工作目录里
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+# 为什么锚定脚本目录:从任何 cwd 启动,配置和落盘目录都跟着脚本走,不会散在工作目录里
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(HERE, "text_server.toml")
 
-try:
-    import text_server_config as _config  # 可选:与脚本同目录,不在就忽略
-except ModuleNotFoundError as error:
-    # 为什么细分 error.name:配置文件里 import 的库缺失时抛的也是 ModuleNotFoundError,
-    # 那种情况必须炸出来,不能悄悄退回默认参数、让人以为配置已经生效
-    if error.name != "text_server_config":
-        raise
-    _config = None
+# 字段名 -> 默认值;TOML 里写了哪个就覆盖哪个,没写的用这里的值
+DEFAULTS: dict[str, Any] = {
+    "host": "0.0.0.0",  # 监听地址,0.0.0.0 = 所有网卡
+    "port": 8080,  # 监听端口
+    "upload_dir": os.path.join(HERE, "uploads"),  # 落盘目录
+}
 
-if _config is not None:
-    HOST = getattr(_config, "HOST", HOST)
-    PORT = getattr(_config, "PORT", PORT)
-    UPLOAD_DIR = getattr(_config, "UPLOAD_DIR", UPLOAD_DIR)
+# 为什么留一份模板:同目录没有 text_server.toml 时,报错信息里直接给出可照抄的完整内容
+CONFIG_TEMPLATE = """\
+# 是什么: text_server 的本地配置,放脚本同目录,只写要改的字段,缺的字段用脚本里的默认值.
+host = "0.0.0.0"        # 监听地址, 0.0.0.0 = 所有网卡
+port = 8080             # 监听端口
+upload_dir = "uploads"  # 落盘目录, 相对路径按本文件所在目录解析
+"""
+
+
+def load_config(path: str = CONFIG_FILE) -> tuple[str, int, str]:
+    """读 text_server.toml 并校验,返回 (host, port, upload_dir);文件不存在就全用 DEFAULTS。
+
+    为什么多出来的字段要报错而不是忽略:配置里出现 DEFAULTS 之外的键一定是笔误(比如
+    prot = 9000),静默忽略会让人以为配置生效了其实没有——旧的 .py 配置就是这个问题。
+    为什么相对路径按本文件所在目录解析:配置和脚本在一起,这样从任何 cwd 启动都指向同一处。
+    """
+    values: dict[str, Any] = dict(DEFAULTS)
+
+    if os.path.isfile(path):
+        # tomllib 只接受二进制流,且只解析不写回,所以配置文件不会被程序改动
+        try:
+            with open(path, "rb") as handle:
+                raw: dict[str, Any] = tomllib.load(handle)
+        except tomllib.TOMLDecodeError as error:
+            # 手改配置最常见的失误就是 TOML 语法写错,而原始报错不带文件名,这里补上
+            raise SystemExit(f"{path} 语法错误: {error}")
+        unknown = sorted(set(raw) - set(DEFAULTS))
+        if unknown:
+            raise SystemExit(f"{path} 里有不认识的字段 {unknown},可用字段 "
+                             f"{sorted(DEFAULTS)}\n\n{CONFIG_TEMPLATE}")
+        values.update(raw)
+
+    host = values["host"]
+    if not isinstance(host, str) or not host.strip():
+        raise SystemExit(f"配置项 host 必须是非空字符串: {host!r}")
+
+    port = values["port"]
+    # 为什么单独挡 bool:TOML 的 true/false 在 Python 里是 int 的子类,int(True) == 1 会被静默当成端口 1
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise SystemExit(f"配置项 port 必须是整数: {port!r}")
+    if not 1 <= port <= 65535:
+        raise SystemExit(f"配置项 port 超出 1-65535: {port}")
+
+    upload_dir = values["upload_dir"]
+    if not isinstance(upload_dir, str) or not upload_dir.strip():
+        raise SystemExit(f"配置项 upload_dir 必须是非空字符串: {upload_dir!r}")
+    # 为什么 expanduser:配置里写 ~/drop 也能落在预期位置(TOML 只能写字符串,不能算表达式)
+    upload_dir = os.path.expanduser(upload_dir.strip())
+    if not os.path.isabs(upload_dir):
+        upload_dir = os.path.join(HERE, upload_dir)
+
+    return host.strip(), port, upload_dir
+
 
 # 为什么:输出重定向到文件/管道时 stdout 默认块缓冲,收到的内容会卡在缓冲区里看不见
 if hasattr(sys.stdout, "reconfigure"):
@@ -253,18 +304,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    Handler.upload_dir = os.path.abspath(UPLOAD_DIR)
+    host, port, upload_dir = load_config()
+    Handler.upload_dir = os.path.abspath(upload_dir)
     os.makedirs(Handler.upload_dir, exist_ok=True)
+    # 是:启动时打一行,让人一眼看出配置到底是从文件来的还是全用默认值
+    config_note = CONFIG_FILE if os.path.isfile(CONFIG_FILE) else "(无配置文件,全用默认值)"
     try:
         # 为什么多线程:HTTPServer 是单线程的,一个挂住的连接会把后面所有请求一起堵死
-        with ThreadingHTTPServer((HOST, PORT), Handler) as server:
-            # 为什么用 server_address[1] 而不是 PORT:PORT 写 0 时由系统挑端口,这里报的是真实端口
-            print(f"receiving on http://{HOST}:{server.server_address[1]}/  ->  {Handler.upload_dir}")
+        with ThreadingHTTPServer((host, port), Handler) as server:
+            # 为什么用 server_address[1] 而不是 port:port 写 0 时由系统挑端口,这里报的是真实端口
+            print(f"receiving on http://{host}:{server.server_address[1]}/  ->  {Handler.upload_dir}")
+            print(f"config: {config_note}")
             server.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
     except OSError as error:
-        print(f"error: 监听 {HOST}:{PORT} 失败: {error}", file=sys.stderr)
+        print(f"error: 监听 {host}:{port} 失败: {error}", file=sys.stderr)
         return 1
     return 0
 

@@ -1,5 +1,5 @@
 uploads
-text_server_config.py
+text_server.toml
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
