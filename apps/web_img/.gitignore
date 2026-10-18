@@ -1,6 +1,0 @@
-# 是什么: web_img 的本地文件忽略规则,只在本目录生效.
-# 为什么: main.py 固定读当前目录下的 conf.toml, 而 dir 通常指向本机私有目录,
-#         所以本地配置不入库;缺什么字段看 main.py 里的 CONFIG_TEMPLATE 或 README.
-conf.toml
-# 虚拟环境是每台机器各自重建的, 不入库.
-.venv/
