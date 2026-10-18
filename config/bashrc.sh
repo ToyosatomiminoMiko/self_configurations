@@ -1,5 +1,5 @@
 
-# 用户定义 User-defined
+# 用户定义 user defined
 # cargo
 . "$HOME/.cargo/env"
 # rustup
@@ -13,11 +13,11 @@ export VIRTUAL_ENV_DISABLE_PROMPT=1
 
 # 颜色定义(解耦颜色值)
 # 使用 256 色或标准颜色,便于修改
-COLOR_VENV="\033[38;2;144;255;144m"   # 浅绿
-COLOR_USER="\033[38;2;243;168;183m"   # 粉红
-COLOR_TIME="\033[38;2;91;206;250m"    # 粉蓝
-COLOR_PATH="\033[38;2;255;255;255m"   # 白色
-COLOR_RESET="\033[0m"
+COLOR_VENV="\x1b[38;2;144;255;144m"   # 浅绿
+COLOR_USER="\x1b[38;2;243;168;183m"   # 粉红
+COLOR_TIME="\x1b[38;2;91;206;250m"    # 粉蓝
+COLOR_PATH="\x1b[38;2;255;255;255m"   # 白色
+COLOR_RESET="\x1b[0m"
 
 # venv 提示函数
 __venv_prompt() {
@@ -49,9 +49,9 @@ export PS1
 
 # 仅交互式 shell 打印:否则会污染 scp/sftp/rsync 等非交互会话的协议流
 if [[ $- == *i* ]]; then
-    printf "Was vernünftig ist, das ist wirklich;\r\n"
-    printf "und was wirklich ist, das ist vernünftig.\r\n"
-    printf "                                         ---- G.W.F.Hegel\r\n"
+    printf "Was vernünftig ist, das ist wirklich;\n"
+    printf "und was wirklich ist, das ist vernünftig.\n"
+    printf "                                         ---- G.W.F.Hegel\n"
 fi
 
 #fastfetch #--sixel ~/fetch.png --logo-width 40
